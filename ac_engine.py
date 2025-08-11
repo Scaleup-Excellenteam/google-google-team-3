@@ -139,8 +139,9 @@ def _best_prefix_score(line_norm: str, qnorm: str) -> tuple[int | None, int | No
 
 def normalize(s: str) -> str:
     """Case-insensitive normalization."""
-    s = re.sub(r'[^A-Za-z0-9 ]','',s)
-    return s.lower()
+    s = re.sub(r'[^A-Za-z0-9 ]', '', s)
+    s = re.sub(r'\s+', ' ', s)  # Collapse multiple spaces to one
+    return s.lower().strip()
 
 
 def trigrams(s: str) -> Iterable[str]:
@@ -205,7 +206,7 @@ class AutoCompleteEngine:
         if not query_trigrams:
             return set(range(len(self.entries)))
 
-        # Start with trigram that has fewest matches
+        # Start with trigram that has the fewest matches
         trigram_sets = [(self.tri2ids.get(tg, set()), tg) for tg in query_trigrams]
         trigram_sets.sort(key=lambda x: len(x[0]))
 
@@ -220,34 +221,57 @@ class AutoCompleteEngine:
 
         return candidates
 
-    def _get_fuzzy_candidates(self, query_norm: str) -> Set[int]:
-        """Get additional candidates by relaxing trigram requirements."""
-        query_trigrams = list(trigrams(query_norm))
-        if len(query_trigrams) <= 2:
-            # For very short queries, return all entries
+    def _get_distanced_candidates(self, query_norm: str, max_drop: int = 3) -> Set[int]:
+        """
+        One-edit (≤1) candidate gen using the q-gram filter:
+        with q=3, a single edit can invalidate up to 3 adjacent trigrams.
+        We allow dropping any contiguous block of length 1..max_drop (default 3).
+        """
+        qgs = list(trigrams(query_norm))
+        n = len(qgs)
+        # Very short query: let the verifier decide.
+        if n <= 1:
             return set(range(len(self.entries)))
 
-        candidates = set()
+        lists = [self.tri2ids.get(tg, set()) for tg in qgs]
 
-        # Try combinations requiring fewer trigrams (more permissive)
-        for min_trigrams in range(max(1, len(query_trigrams) - 2), len(query_trigrams)):
-            for trigram_combo in combinations(query_trigrams, min_trigrams):
-                trigram_sets = [self.tri2ids.get(tg, set()) for tg in trigram_combo]
-                if all(trigram_sets):
-                    combo_candidates = trigram_sets[0].copy()
-                    for ts in trigram_sets[1:]:
-                        combo_candidates &= ts
-                    candidates.update(combo_candidates)
+        # prefix/suffix cumulative intersections: pref[i] = ∩ lists[0..i], suff[i] = ∩ lists[i..n-1]
+        pref: List[Set[int]] = [set() for _ in range(n)]
+        suff: List[Set[int]] = [set() for _ in range(n)]
+        pref[0] = lists[0].copy()
+        for i in range(1, n):
+            pref[i] = pref[i - 1] & lists[i]
+        suff[n - 1] = lists[n - 1].copy()
+        for i in range(n - 2, -1, -1):
+            suff[i] = suff[i + 1] & lists[i]
 
-        # If still no candidates found, be even more permissive
-        if not candidates and len(query_trigrams) > 1:
-            # Try requiring just 1 trigram match
-            for tg in query_trigrams:
-                candidates.update(self.tri2ids.get(tg, set()))
+        out: Set[int] = set()
+        # Drop a contiguous block [i..j] of length d=1..max_drop and intersect the rest:
+        #   result = (∩ lists[0..i-1]) ∩ (∩ lists[j+1..n-1])  => pref[i-1] ∩ suff[j+1]
+        for d in range(1, min(max_drop, n) + 1):
+            for i in range(0, n - d + 1):
+                j = i + d - 1
+                if i == 0 and j == n - 1:
+                    # Dropping ALL trigrams (only possible when n <= max_drop) -> fallback to all docs
+                    out |= set(range(len(self.entries)))
+                elif i == 0:
+                    out |= suff[j + 1]
+                elif j == n - 1:
+                    out |= pref[i - 1]
+                else:
+                    out |= (pref[i - 1] & suff[j + 1])
 
-        return candidates
+        # Safety fallback: if still empty, use union of the 2–3 rarest trigrams
+        if not out:
+            order = sorted(range(n), key=lambda idx: len(lists[idx]))
+            uni: Set[int] = set()
+            for idx in order[:min(3, n)]:
+                uni |= lists[idx]
+            out = uni
 
-    def query_prefix_all(self, query: str, allow_one_typo: bool = True, topn: int = 5) -> List[AutoCompleteData]:
+        return out
+
+    def get_best_k_completions(self, query: str, allow_one_typo: bool = True, topn: int = 5) -> List[AutoCompleteData]:
         """Find all sentences where query appears as substring with ≤1 typo."""
         query_norm = normalize(query)
         if not query_norm:
@@ -256,15 +280,11 @@ class AutoCompleteEngine:
         # Get candidates
         candidates = self._get_exact_candidates(query_norm)
         if not len(candidates) > topn and allow_one_typo:
-            fuzzy_candidates = self._get_fuzzy_candidates(query_norm)
-            candidates.update(fuzzy_candidates)
-
-
-        # Check candidates and collect results
+            distanced_candidates = self._get_distanced_candidates(query_norm)
+            candidates.update(distanced_candidates)
 
         # Collect best score per line
         best: dict[tuple[str, str], tuple[int, int]] = {}
-        # key -> (score, entry_idx). key is (source, norm) to dedupe identical lines.
 
         for idx in candidates:
             if idx >= len(self.entries):
@@ -294,7 +314,6 @@ class AutoCompleteEngine:
         # Primary: higher score first; Tie-breaker 1: sentence A→Z; Tie-breaker 2: source A→Z
         items.sort(key=lambda t: (-t[0], t[1].lower(), t[2].lower()))
 
-        # Take the first N
         N = int(topn) if topn is not None else len(items)
         chosen = items[:N]
 
@@ -319,7 +338,7 @@ def load_engine() -> AutoCompleteEngine:
         engine.build_from_json(JSON_PATH)
         engine.save(INDEX_PATH)
         return engine
-    
+
     return AutoCompleteEngine.load(INDEX_PATH)
 
 
@@ -328,14 +347,14 @@ if __name__ == "__main__":
     engine = load_engine()
     print("Loading complete.")
 
-    query = input("\nEnter query: (CTRL+D To exit, # to start over)").strip()
+    query = input("Enter query: (CTRL+D To exit, # to start over)\n").strip()
     while True:
         try:
-            if not query or query == "#":
-                query = input("\nEnter query: ").strip()
+            if not query or query[-1] == "#":
+                query = input("Enter query: \n").strip()
                 continue
 
-            results = engine.query_prefix_all(query, allow_one_typo=True)
+            results = engine.get_best_k_completions(query, allow_one_typo=True)
             if not results:
                 print("-> No matches found.")
             else:
@@ -346,10 +365,10 @@ if __name__ == "__main__":
                     print(f"  {i}. score={result.score} {result.completed_sentence} ({file_name, line_number})")
 
             # Prompt for next input, showing the current query as prefix
-            next_input = input(f"\n{query} ").strip()
+            next_input = input(f"{query}")
             if next_input:
                 # Append new input to the current query
-                query = f"{query} {next_input}".strip()
+                query = f"{query}{next_input}".strip()
             # If just Enter, keep the query as is (user can keep extending)
         except KeyboardInterrupt:
             print("\nGoodbye!")
