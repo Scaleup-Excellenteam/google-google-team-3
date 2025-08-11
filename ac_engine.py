@@ -1,6 +1,7 @@
 # ac_engine.py — prefix substring search (case-insensitive), ≤1 typo; returns ALL matching lines
 import os
 import json
+import orjson
 import pickle
 from collections import defaultdict
 from dataclasses import dataclass
@@ -190,15 +191,22 @@ class AutoCompleteEngine:
                 self.tri2ids[trigram].add(idx)
 
     def save(self, path: str):
-        """Save engine to pickle file."""
-        with open(path, "wb") as f:
+        """Save engine to compressed pickle file."""
+        import gzip
+        with gzip.open(f"{path}.gz", "wb") as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @staticmethod
     def load(path: str) -> "AutoCompleteEngine":
-        """Load engine from pickle file."""
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        """Load engine from compressed pickle file."""
+        import gzip
+        compressed_path = f"{path}.gz"
+        if os.path.exists(compressed_path):
+            with gzip.open(compressed_path, "rb") as f:
+                return pickle.load(f)
+        else:
+            with open(path, "rb") as f:
+                return pickle.load(f)
 
     def _get_exact_candidates(self, query_norm: str) -> Set[int]:
         """Get candidates that contain all trigrams of the query."""
@@ -312,6 +320,7 @@ class AutoCompleteEngine:
             items.append((score, raw, src, idx))
 
         # Primary: higher score first; Tie-breaker 1: sentence A→Z; Tie-breaker 2: source A→Z
+
         items.sort(key=lambda t: (-t[0], t[1].lower(), t[2].lower()))
 
         N = int(topn) if topn is not None else len(items)
@@ -325,6 +334,7 @@ class AutoCompleteEngine:
 
 def load_engine() -> AutoCompleteEngine:
     """Load or build autocomplete engine."""
+
     if not os.path.exists(JSON_PATH):
         raise FileNotFoundError(f"Missing '{JSON_PATH}'. Run json_init.py first.")
 
@@ -334,6 +344,7 @@ def load_engine() -> AutoCompleteEngine:
     )
 
     if need_build:
+        print("Need to build the autocomplete index from JSON data.")
         engine = AutoCompleteEngine()
         engine.build_from_json(JSON_PATH)
         engine.save(INDEX_PATH)
@@ -346,7 +357,6 @@ if __name__ == "__main__":
     print("Loading autocomplete engine...")
     engine = load_engine()
     print("Loading complete.")
-
     query = input("Enter query: (CTRL+D To exit, # to start over)\n").strip()
     while True:
         try:
